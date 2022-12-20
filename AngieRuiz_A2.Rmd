@@ -1,0 +1,263 @@
+---
+title: "Assignment 2"
+author: "Angie Ruiz"
+date: "9/16/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+install.packages(mapview)
+
+```{r, include = F}
+knitr::opts_chunk$set(warning = F, message = F)
+
+Sys.setenv(CENSUS_KEY="d6d92526ea8c2244f10c11195579193f2ed68250")
+```
+
+```{r}
+library(tigris)
+library(tidyverse)
+library(sf)
+library(mapview)
+library(leaflet)
+library(censusapi)
+
+ca_counties <- counties("CA", cb = T, progress_bar = F)
+
+alameda <- 
+  ca_counties %>%
+  filter(NAME %in% "Alameda")
+
+fremont <- places("CA", cb = T, progress_bar = FALSE) %>%
+  filter(NAME %in% "Fremont")
+  
+  
+```
+
+
+
+This assignment builds directly off of material from Chapter 2, so start by preparing 2020 data for your place of interest. 
+
+Make sure you are using the developer version of `tigris`, as explained in Chapter 2.3, which will let you grab 2020 block shapefiles correctly.
+
+```{r}
+dec_vars_2010 <-
+  listCensusMetadata(
+    name = "2010/dec/pl",
+    type = "variables"
+  )
+
+dec_vars_2020 <-
+  listCensusMetadata(
+    name = "2020/dec/pl",
+    type = "variables"
+  )
+
+#Alameda County 2010 and 2020 data of total Black and African American alone population, used variables P001004 and P2_006N which were
+#for people who only selected one race and doesn't specify by age.
+ala_aapop_2010 <-
+  getCensus("dec/pl",
+            vintage = 2010,
+            region = "block:*",
+            regionin = "state:06+county:001",
+            vars = "P001004") %>% 
+  transmute(
+    GEOID10 = paste0(state,county,tract,block),
+    pop_2010 = "P001004"
+  )
+
+ala_aapop_2020 <-
+  getCensus("dec/pl",
+            vintage = 2020,
+            region = "block:*",
+            regionin = "state:06+county:001",
+            vars = "P2_006N") %>% 
+  transmute(
+    GEOID20 = paste0(state,county,tract,block),
+    pop_2020 = "P2_006N"
+  )
+
+ala_blocks_2010 <- blocks("CA","Alameda", year = 2010, progress_bar = F) %>%
+  mutate(
+    area = st_area(.)
+  )
+
+ala_blocks_2020 <- blocks("CA","Alameda", year = 2020, progress_bar = F) %>%
+  mutate(
+    area = st_area(.)
+  )
+
+```
+
+Now, to begin constructing our aligned geometry set, I first choose to define my set of mapped blocks as the 2010 blocks whose centroids lie within the (default 2019) place boundary. You specify your own selected place below.
+
+```{r}
+
+ala_blocks_2010 <- ala_blocks_2010 %>% 
+  st_centroid() %>% 
+  .[fremont, ] %>% 
+  st_drop_geometry() %>% 
+  left_join(ala_blocks_2010 %>% select(GEOID10, area)) %>% 
+  st_as_sf() %>% 
+  select(GEOID10) %>% 
+  left_join(ala_aapop_2010)
+
+mapview(fremont) + mapview(ala_blocks_2010, alpha.regions = 0, color = "red", lwd = 2)
+```
+
+Next, to perform spatial subsetting, we'll need all 2020 blocks that intersect with 2010 blocks.
+
+```{r}
+ala_blocks_2020 <- ala_blocks_2020 %>%
+  .[fremont, ] %>% 
+  select(GEOID20) %>% 
+  left_join(ala_aapop_2020)
+```
+
+Now, I follow the spatial subsetting method shown in Chapter 2.4.
+
+```{r}
+ala_blocks_2020_intersect <- ala_blocks_2020 %>% 
+  st_transform(26910) %>% 
+  mutate(original_area = st_area(.)) %>% 
+  st_intersection(
+    ala_blocks_2010 %>%
+      select(GEOID10) %>% 
+      st_transform(26910)
+  ) %>% 
+  mutate(
+    leftover_area = st_area(.),
+    perc_area = as.numeric(leftover_area / original_area),
+    pop_2020 = pop_2020 * perc_area
+  )
+```
+
+At this point, the dataframe has both GEOID20 and GEOID10 IDs. The GEOID10 IDs tell us which GEOID20 pieces can be pieced together to form the full GEOID10 shape. So we can group and summarize to get the 2020 population counts within the GEOID10 boundaries. We don't need to retain geometries at this step, since we can join this back to the 2010 data.
+
+```{r}
+ala_blocks_2020_reshaped <- ala_blocks_2020_intersect %>%
+  st_drop_geometry() %>% 
+  group_by(GEOID10) %>% 
+  summarize(
+    pop_2020 = sum(pop_2020, na.rm=T) %>% round()
+  )
+```
+
+Lastly, I join this to `place_blocks_2010` and compute the absolute difference. To compute density in people per acre, I transform to a planar coordinate system with units in ft and do the appropriate math. Note that `st_area()` produces results in a "unit" class, which can be converted to regular numbers using `as.numeric()`.
+
+```{r}
+projection <- ala_blocks_2020_reshaped
+
+ala_pop_2010_2020 <- ala_blocks_2010 %>% 
+  left_join(projection) %>% 
+  mutate(
+    absolute_pop = (pop_2020 - pop_2010) / as.numeric(st_area(.)) * 43560
+  )
+```
+
+The SF Chronicle example has a color palette that goes from red negative values to green negative values, with white in the center. To get our color pallete to be symmetrical across 0, we need the minimum and maximum bounds to be equidistant from 0. For our absolute change, let's try stretching one bound to meet the other. Using https://www.nceas.ucsb.edu/sites/default/files/2020-04/colorPaletteCheatsheet.pdf, we can identify "PiYG" as a satisfactory palette for our purposes.
+
+```{r}
+
+pal <- colorNumeric(
+  palette = "PiYG",
+  domain = c(-15,15)
+)
+```
+
+
+Lastly, map.
+
+```{r}
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addPolygons(
+    fillColor = ~pal(absolute_pop),
+    label = ~round(absolute_pop),
+    color = "white",
+    opacity = 0.5,
+    fillOpacity = 0.75,
+    weight = 1
+  ) %>% 
+  addLegend(
+    data = ala_pop_2010_2020,
+    pal = pal,
+    value = c(-15,15),
+    title = "Black/African American single race Population Change From 2010 to 2020"
+  )
+
+'''
+#Using PDAS to Estimate Populations
+
+
+bay_pdas <- st_read("https://opendata.arcgis.com/datasets/4df9cb38d77346a289252ced4ffa0ca0_0.geojson")
+
+ala_pdas <-
+  bay_pdas %>% 
+  filter(county == "Alameda") %>% 
+  st_transform(4269)
+
+
+ala_pdas_blocks <- ala_blocks_2020[ala_pdas, ]
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addPolygons(
+    data = ala_pdas,
+    stroke = F,
+    fillOpacity = 0.5
+  ) %>% 
+  addPolygons(
+    data = ala_pdas_blocks,
+    color = "red",
+    weight = 0.75,
+    fill = F
+  )
+
+ala_pdas_blocks1 <- ala_pdas_blocks %>% 
+  select(block = GEOID20) %>% 
+  left_join(ala_aapop_2020)
+
+sum(ala_pdas_blocks1$pop)
+
+ala_pdas2 <-
+  bay_pdas %>% 
+  filter(county == "Alameda") %>% 
+  st_transform(4269)
+
+ala_pdas_blocks2 <- ala_blocks_2010[ala_pdas, ]
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addPolygons(
+    data = ala_pdas2,
+    stroke = F,
+    fillOpacity = 0.5
+  ) %>% 
+  addPolygons(
+    data = ala_pdas_blocks2,
+    color = "red",
+    weight = 0.75,
+    fill = F
+  )
+
+sum(ala_pdas_blocks2$pop)
+```
+
+If you want to try multiple layers, you'll need to change some steps upstream to collect more than one field of information for each block. Then, you final leaflet step would look something like this:
+
+
+You can also put layers in groups. But note: `addLayersControl()` currently does not support the toggling on/off of layers when you use `baseGroups`, which are the radio button selections. Instead you'd need to use `overlayGroups`, which are checkboxes.
+
+#Analysis
+'''
+There were some calculations I was unable to code properly so the reader should know that these numbers are subject to human (my) error. 
+
+One of the critical assumptions made when mapping is that the population is evenly distributed within the original geometry.
+
+Based on the map, I can see that population changes vary drastically within Fremont. This could be due to proximity to resources, jobs, and infrastructure which influence whether or not people moved in or out from 2010 to 2020, or it could indicate a gap in Census data between different blocks of Fremont.
+
+
+
+'''
